@@ -103,11 +103,41 @@ Editor header **Compare** toggle. When on, the canvas splits into two panes
 showing the original (fetched once via `/preview` with empty ops) next to the
 current edited preview. Toggling doesn't reset the pipeline.
 
+## Archive uploads
+
+`POST /api/projects/<id>/images?name=<archive>` also accepts `.zip`, `.tar`,
+`.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tgz`, `.tbz`, `.tbz2`, `.txz`. The server
+streams the raw upload to a temp file, then extracts each contained image
+with a supported extension into `originals/` (unique-suffixed on collision).
+The response shape is different from a plain image upload:
+
+```json
+{
+  "archive": {"kind": "zip", "name": "bundle.zip"},
+  "extracted": [{name, size, modified_at, editable}, …],
+  "skipped":   [{name, reason}, …]
+}
+```
+
+Traversal safety: `safe_filename(basename(member))` before writing, so archive
+members can never escape `originals/`. Directory members inside archives are
+ignored.
+
+## FITS
+
+`.fits`, `.fit`, `.fts` are now first-class editable inputs. The server-side
+`load_source_as_rgb()` uses `astropy.io.fits` to open FITS files and applies
+a 0.5% / 99.5% percentile stretch to 8-bit RGB before the pipeline runs.
+2-D data → grayscale-in-RGB; 3-D with a size-3 axis → colour (channel axis
+auto-detected). `render_pipeline()` and the InstructIR handler both go
+through the same loader.
+
+Requires astropy (`pip install --user --break-system-packages astropy` on
+Ubuntu 24 / Python 3.12).
+
 ## Not yet supported (followups)
-- Uploading `.zip` / `.tar` / `.tar.gz` archives and extracting images.
-- FITS decoding for the editor pipeline (astropy) — FITS uploads work, but
-  the editor currently marks them `Not editable`.
 - RAW decoding (`rawpy`).
+- Bayered FITS (needs demosaic before percentile stretch).
 - Crop with rubber-band selection.
 - Delete inputs.
 - Persist named presets of pipelines.

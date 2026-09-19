@@ -3,12 +3,25 @@
 
   // ---------------- constants ----------------
   const IMAGE_PREVIEW_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
-  const UPLOAD_EXT = new Set([
+  const IMAGE_UPLOAD_EXT = new Set([
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp",
     ".fits", ".fit", ".fts",
     ".cr2", ".cr3", ".nef", ".arw", ".raf", ".dng", ".orf", ".rw2",
   ]);
-  const EDITABLE_EXT = new Set([".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"]);
+  const ARCHIVE_EXT_SIMPLE = new Set([".zip", ".tar", ".tgz", ".tbz", ".tbz2", ".txz"]);
+  const ARCHIVE_EXT_COMPOUND = [".tar.gz", ".tar.bz2", ".tar.xz"];
+  const UPLOAD_EXT = new Set([...IMAGE_UPLOAD_EXT, ...ARCHIVE_EXT_SIMPLE]);
+  const EDITABLE_EXT = new Set([".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp",
+                                ".fits", ".fit", ".fts"]);
+
+  function isArchive(name) {
+    const low = (name || "").toLowerCase();
+    for (const s of ARCHIVE_EXT_COMPOUND) if (low.endsWith(s)) return true;
+    return ARCHIVE_EXT_SIMPLE.has(extOf(low));
+  }
+  function isAcceptedUpload(name) {
+    return isArchive(name) || IMAGE_UPLOAD_EXT.has(extOf(name));
+  }
 
   const SLIDER_DEFAULTS = { brightness: 1, contrast: 1, gamma: 1, saturation: 1 };
   const LEVELS_DEFAULT = { black: 0, white: 255, gamma: 1 };
@@ -99,8 +112,8 @@
         };
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
-            try { resolve(JSON.parse(xhr.responseText).image); }
-            catch { resolve({ name: file.name, size: file.size }); }
+            try { resolve(JSON.parse(xhr.responseText)); }
+            catch { resolve({ image: { name: file.name, size: file.size } }); }
           } else {
             let msg = `HTTP ${xhr.status}`;
             try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
@@ -343,7 +356,7 @@
   }
 
   function isEditableExt(name) {
-    return new Set([".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"]).has(extOf(name));
+    return EDITABLE_EXT.has(extOf(name));
   }
 
   // ---------------- uploads ----------------
@@ -369,8 +382,7 @@
     const bar = row.querySelector(".upload-progress-bar");
     const status = row.querySelector(".upload-status");
     uploadList.appendChild(row);
-    const ext = extOf(file.name);
-    if (ext && !UPLOAD_EXT.has(ext)) {
+    if (!isAcceptedUpload(file.name)) {
       row.classList.add("is-err"); bar.style.width = "100%"; status.textContent = "type";
       toast(`Skipped "${file.name}" — unsupported type`, "warn");
       return { run: async () => {} };
@@ -379,11 +391,25 @@
       run: async () => {
         status.textContent = "0%";
         try {
-          await api.uploadImage(projectId, file, (frac) => {
+          const res = await api.uploadImage(projectId, file, (frac) => {
             const pct = Math.round(frac * 100);
             bar.style.width = pct + "%"; status.textContent = pct + "%";
           });
-          bar.style.width = "100%"; row.classList.add("is-done"); status.textContent = "done";
+          bar.style.width = "100%"; row.classList.add("is-done");
+          if (res && res.archive) {
+            const n = (res.extracted || []).length;
+            const skipped = (res.skipped || []).length;
+            status.textContent = `+${n} image${n === 1 ? "" : "s"}${skipped ? " (" + skipped + " skipped)" : ""}`;
+            row.title = skipped ? (res.skipped || []).map((s) => `${s.name}: ${s.reason}`).join("\n") : "";
+            if (n === 0) {
+              row.classList.remove("is-done"); row.classList.add("is-err");
+              toast(`"${file.name}" contained no supported images`, "warn");
+            } else {
+              toast(`Extracted ${n} image${n === 1 ? "" : "s"} from "${file.name}"`, "success");
+            }
+          } else {
+            status.textContent = "done";
+          }
         } catch (err) {
           row.classList.add("is-err"); bar.style.width = "100%"; status.textContent = "failed";
           row.title = err.message || "upload failed";
