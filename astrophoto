@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+"""Astrophotography web app launcher.
+
+Serves the SPA in ./www and a JSON API for:
+  - projects
+  - uploaded input images (per-project /originals/)
+  - non-destructive image processing (preview + save into /outputs/)
+
+Requires Pillow (PIL).
+"""
+
+import base64
+import hashlib
+import http.server
+import io
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shlex
+import shutil
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+except ImportError:
+    print("error: Pillow is required. Install with:  pip install pillow", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import numpy as np
+    from scipy import ndimage as _ndimage  # noqa: F401
+    _HAVE_NUMPY = True
+except ImportError:
+    _HAVE_NUMPY = False
+
+HOST = "0.0.0.0"
+PORT = 6991
+ROOT = Path(__file__).resolve().parent
+WWW = ROOT / "www"
+DATA = ROOT / "data"
+PROJECTS_JSON = DATA / "projects.json"
+
+# Extensions accepted for upload.
+UPLOAD_EXT = {
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp",
+    ".fits", ".fit", ".fts",
+    ".cr2", ".cr3", ".nef", ".arw", ".raf", ".dng", ".orf", ".rw2",
+}
+# Extensions the editor can currently process (Pillow-supported).
+EDITABLE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
+# Output formats we allow saving to.
+SAVE_FORMATS = {"jpg": ("JPEG", ".jpg"), "png": ("PNG", ".png"), "tiff": ("TIFF", ".tif")}
+
+_state_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# storage helpers
+# ---------------------------------------------------------------------------
+
+def load_projects() -> list:
+    if not PROJECTS_JSON.exists():
+        return []
+    try:
+        with PROJECTS_JSON.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_projects(projects: list) -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = PROJECTS_JSON.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(projects, f, indent=2)
+    tmp.replace(PROJECTS_JSON)
+
+
+def new_id() -> str:
+    return secrets.token_hex(8)
+
+
+def safe_filename(name: str) -> str:
+    name = os.path.basename(name or "")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._") or "file"
+    return name[:200]
+
+
+def unique_path(directory: Path, filename: str) -> Path:
+    base, ext = os.path.splitext(filename)
+    p = directory / filename
+    i = 1
+    while p.exists():
+        p = directory / f"{base}-{i}{ext}"
+        i += 1
+    return p
+
+
+def project_dirs(pid: str) -> tuple[Path, Path]:
+    return DATA / pid / "originals", DATA / pid / "outputs"
+
+
+def list_files(d: Path) -> list:
+    if not d.is_dir():
+        return []
+    out = []
+    for entry in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+        if entry.is_file():
+            s = entry.stat()
+            out.append({
+                "name": entry.name,
+                "size": s.st_size,
+                "modified_at": int(s.st_mtime),
+                "editable": entry.suffix.lower() in EDITABLE_EXT,
+            })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# image processing pipeline
+# ---------------------------------------------------------------------------
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _op_number(op, key, default, lo=None, hi=None):
+    try:
+        v = float(op.get(key, default))
+    except (TypeError, ValueError):
+        v = default
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
+def apply_auto_stretch(img, low_pct=0.5, high_pct=99.5):
+    """Percentile-based per-channel stretch. Classic astro cleanup."""
+    img = img.convert("RGB")
+    channels = img.split()
+    out = []
+    for ch in channels:
+        hist = ch.histogram()
+        total = sum(hist)
+        if total == 0:
+            out.append(ch); continue
+        lo_target = total * (low_pct / 100.0)
+        hi_target = total * (high_pct / 100.0)
+        cum = 0; lo = 0; hi = 255
+        for i, c in enumerate(hist):
+            cum += c
+            if cum >= lo_target: lo = i; break
+        cum = 0
+        for i, c in enumerate(hist):
+            cum += c
+            if cum >= hi_target: hi = i; break
+        if hi <= lo: hi = min(255, lo + 1)
+        scale = 255.0 / (hi - lo)
+        lut = [_clamp(int((v - lo) * scale + 0.5), 0, 255) for v in range(256)]
+        out.append(ch.point(lut))
+    return Image.merge("RGB", out)
+
+
+def apply_levels(img, black=0, white=255, gamma=1.0):
+    black = int(_clamp(black, 0, 254))
+    white = int(_clamp(white, black + 1, 255))
+    gamma = max(0.01, float(gamma))
+    inv = 1.0 / gamma
+    def curve(v):
+        t = (v - black) / (white - black)
+        t = _clamp(t, 0.0, 1.0)
+        return int(_clamp((t ** inv) * 255.0 + 0.5, 0, 255))
+    lut = [curve(v) for v in range(256)]
+    img = img.convert("RGB")
+    return Image.merge("RGB", [c.point(lut) for c in img.split()])
+
+
+def apply_gamma(img, gamma=1.0):
+    gamma = max(0.01, float(gamma))
+    inv = 1.0 / gamma
+    lut = [int(_clamp((v / 255.0) ** inv * 255.0 + 0.5, 0, 255)) for v in range(256)]
+    img = img.convert("RGB")
+    return Image.merge("RGB", [c.point(lut) for c in img.split()])
+
+
+def apply_auto_enhance(img):
+    """One-click 'make it pop' pipeline tuned for astro-ish images.
+
+    Per-channel percentile stretch (crushes background, sets highlights),
+    a gentle midtone lift, contrast + saturation nudge, and a subtle
+    unsharp mask. Values chosen to be safe on landscape/portrait photos
+    too, so the button never looks like a mistake.
+    """
+    img = img.convert("RGB")
+
+    # 1) Per-channel percentile stretch with a built-in midtone gamma lift.
+    #    Black point = 0.25th percentile (crush dark sky/noise floor to black).
+    #    White point = 99.7th percentile (protect bright stars from clipping too hard).
+    low_pct, high_pct, midtone_gamma = 0.25, 99.7, 1.25
+    inv_mid = 1.0 / midtone_gamma
+    out_channels = []
+    for ch in img.split():
+        hist = ch.histogram()
+        total = sum(hist)
+        if total == 0:
+            out_channels.append(ch); continue
+        lo_target = total * (low_pct / 100.0)
+        hi_target = total * (high_pct / 100.0)
+        cum = 0; lo = 0
+        for i, c in enumerate(hist):
+            cum += c
+            if cum >= lo_target: lo = i; break
+        cum = 0; hi = 255
+        for i, c in enumerate(hist):
+            cum += c
+            if cum >= hi_target: hi = i; break
+        if hi <= lo: hi = min(255, lo + 1)
+        span = hi - lo
+        lut = []
+        for v in range(256):
+            t = (v - lo) / span
+            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+            t = t ** inv_mid                       # midtone lift
+            lut.append(_clamp(int(t * 255.0 + 0.5), 0, 255))
+        out_channels.append(ch.point(lut))
+    img = Image.merge("RGB", out_channels)
+
+    # 2) Punchier tone + colour.
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Color(img).enhance(1.35)
+
+    # 3) Detail: gentle unsharp mask (threshold avoids amplifying noise floor).
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=110, threshold=3))
+
+    return img
+
+
+def apply_remove_streak(img, angle=0.0, vertical_radius=3, horizontal_radius=15, threshold=10):
+    """Suppress narrow linear artifacts (satellite/plane trails, cosmic rays).
+
+    Algorithm: rotate so the streak lies along the horizontal axis, then use
+    the difference between a *horizontal* median (which preserves horizontally-
+    extended features, i.e. the streak) and a *vertical* median (which sees
+    the streak as an outlier) to classify streak pixels. Stars stay put because
+    they are compact — the horizontal median at a star position looks like the
+    background, so `med_h - med_v` is small there. Replaced pixels take the
+    vertical-median value so the surrounding background flows through cleanly.
+    """
+    if not _HAVE_NUMPY:
+        return img  # graceful degrade: nothing installed
+    ow, oh = img.size
+    if abs(angle) > 0.01:
+        working = img.rotate(-angle, expand=True, resample=Image.BICUBIC)
+    else:
+        working = img
+
+    arr = np.asarray(working.convert("RGB"), dtype=np.int16)
+    vr = max(1, int(vertical_radius))
+    hr = max(vr + 1, int(horizontal_radius))
+    # scipy.ndimage.median_filter is efficient (running rank filter);
+    # size=(1, 2*r+1, 1) uses a 1-D window along axis=1 (columns / horizontal),
+    # size=(2*r+1, 1, 1) along axis=0 (rows / vertical).
+    med_v = _ndimage.median_filter(arr, size=(2 * vr + 1, 1, 1), mode="nearest")
+    med_h = _ndimage.median_filter(arr, size=(1, 2 * hr + 1, 1), mode="nearest")
+
+    thr = int(threshold)
+    # Pixel is on a streak when it's bright relative to its perpendicular
+    # neighbours (diff_v > thr) AND its along-streak neighbourhood is also
+    # bright (diff_h > thr) — i.e. the feature extends along the streak.
+    diff_v = arr - med_v
+    diff_h = med_h - med_v
+    mask = (diff_v > thr) & (diff_h > thr)
+    fixed = np.where(mask, med_v, arr).clip(0, 255).astype(np.uint8)
+    result = Image.fromarray(fixed, mode="RGB")
+
+    if abs(angle) > 0.01:
+        back = result.rotate(angle, expand=True, resample=Image.BICUBIC)
+        bw, bh = back.size
+        left = max(0, (bw - ow) // 2)
+        top = max(0, (bh - oh) // 2)
+        result = back.crop((left, top, left + ow, top + oh))
+    return result
+
+
+def apply_operations(img, ops):
+    for op in ops or []:
+        kind = op.get("op")
+        if kind == "auto_stretch":
+            img = apply_auto_stretch(
+                img,
+                _op_number(op, "low", 0.5, 0, 5),
+                _op_number(op, "high", 99.5, 95, 100),
+            )
+        elif kind == "auto_enhance":
+            img = apply_auto_enhance(img)
+        elif kind == "levels":
+            img = apply_levels(img,
+                black=int(_op_number(op, "black", 0, 0, 254)),
+                white=int(_op_number(op, "white", 255, 1, 255)),
+                gamma=_op_number(op, "gamma", 1.0, 0.1, 5.0),
+            )
+        elif kind == "brightness":
+            img = ImageEnhance.Brightness(img).enhance(_op_number(op, "value", 1.0, 0.0, 3.0))
+        elif kind == "contrast":
+            img = ImageEnhance.Contrast(img).enhance(_op_number(op, "value", 1.0, 0.0, 3.0))
+        elif kind == "saturation":
+            img = ImageEnhance.Color(img).enhance(_op_number(op, "value", 1.0, 0.0, 3.0))
+        elif kind == "gamma":
+            img = apply_gamma(img, _op_number(op, "value", 1.0, 0.1, 5.0))
+        elif kind == "sharpen":
+            img = img.filter(ImageFilter.UnsharpMask(
+                radius=_op_number(op, "radius", 2.0, 0.1, 10.0),
+                percent=int(_op_number(op, "amount", 150, 0, 500)),
+                threshold=int(_op_number(op, "threshold", 3, 0, 50)),
+            ))
+        elif kind == "denoise":
+            size = int(_op_number(op, "size", 3, 3, 9))
+            if size % 2 == 0: size += 1
+            img = img.filter(ImageFilter.MedianFilter(size=size))
+        elif kind == "blur":
+            img = img.filter(ImageFilter.GaussianBlur(radius=_op_number(op, "radius", 1.0, 0.0, 20.0)))
+        elif kind == "rotate":
+            deg = int(_op_number(op, "degrees", 0, -360, 360))
+            # rotate CW (positive UI) matches PIL's negative
+            img = img.rotate(-deg, expand=True, resample=Image.BICUBIC)
+        elif kind == "flip_h":
+            img = ImageOps.mirror(img)
+        elif kind == "flip_v":
+            img = ImageOps.flip(img)
+        elif kind == "grayscale":
+            img = ImageOps.grayscale(img).convert("RGB")
+        elif kind == "invert":
+            img = ImageOps.invert(img.convert("RGB"))
+        elif kind == "remove_streak":
+            img = apply_remove_streak(
+                img,
+                angle=_op_number(op, "angle", 0.0, -360.0, 360.0),
+                vertical_radius=int(_op_number(op, "vertical_radius", 3, 1, 20)),
+                horizontal_radius=int(_op_number(op, "horizontal_radius", 15, 3, 60)),
+                threshold=int(_op_number(op, "threshold", 10, 1, 200)),
+            )
+        # Unknown ops silently ignored so old pipelines still render.
+    return img
+
+
+def render_pipeline(source: Path, ops: list, preview_max: int | None = None) -> Image.Image:
+    with Image.open(source) as raw:
+        img = raw.convert("RGB")
+    if preview_max and preview_max > 0:
+        w, h = img.size
+        m = max(w, h)
+        if m > preview_max:
+            scale = preview_max / m
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return apply_operations(img, ops)
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "astrophoto/0.2"
+    protocol_version = "HTTP/1.1"
+
+    # ---------- send helpers ----------
+    def _send(self, status, body: bytes, content_type: str, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if extra:
+            for k, v in extra.items(): self.send_header(k, v)
+        self.end_headers()
+        if body: self.wfile.write(body)
+
+    def _send_json(self, status, obj): self._send(status, json.dumps(obj).encode("utf-8"), "application/json")
+    def _err(self, status, message): self._send_json(status, {"error": message})
+
+    def _send_file(self, path: Path):
+        ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        try: size = path.stat().st_size
+        except OSError: return self._err(404, "not found")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with path.open("rb") as f: shutil.copyfileobj(f, self.wfile)
+
+    def _static(self, rel):
+        try:
+            target = (WWW / rel).resolve(); target.relative_to(WWW)
+        except (ValueError, OSError):
+            return self._err(403, "forbidden")
+        if not target.is_file(): target = WWW / "index.html"
+        self._send_file(target)
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0: return b""
+        return self.rfile.read(length)
+
+    def _read_json(self):
+        try:
+            body = self._read_body()
+            if not body: return {}
+            return json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+
+    # ---------- project helpers ----------
+    def _project_or_404(self, pid):
+        p = next((x for x in load_projects() if x["id"] == pid), None)
+        if not p: self._err(404, "project not found")
+        return p
+
+    def _resolve_source(self, pid, raw_name: str, kind: str = "inputs") -> Path | None:
+        originals, outputs = project_dirs(pid)
+        base = originals if kind != "outputs" else outputs
+        name = safe_filename(raw_name)
+        p = (base / name).resolve()
+        try: p.relative_to(base.resolve())
+        except (ValueError, OSError): return None
+        return p if p.is_file() else None
+
+    # ---------- routing ----------
+    def do_GET(self):
+        parsed = urlparse(self.path); path = parsed.path
+
+        # WebSocket upgrade — must be checked before the static/API branches
+        # because it uses a hijacked socket after the handshake.
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        if "websocket" in upgrade:
+            m = re.match(r"^/ws/chat/([a-f0-9]+)$", path)
+            if m:
+                return self._handle_chat_ws(m.group(1), parsed)
+            self.send_error(404, "unknown websocket path"); return
+
+        if path == "/api/projects":
+            return self._send_json(200, {"projects": load_projects()})
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)$", path)
+        if m:
+            pid = m.group(1)
+            p = self._project_or_404(pid)
+            if not p: return
+            originals, outputs = project_dirs(pid)
+            return self._send_json(200, {
+                "project": p,
+                "inputs": list_files(originals),
+                "outputs": list_files(outputs),
+            })
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/(inputs|outputs)/([^/]+)$", path)
+        if m:
+            pid, kind, raw = m.group(1), m.group(2), unquote(m.group(3))
+            base = project_dirs(pid)[0 if kind == "inputs" else 1]
+            fp = (base / safe_filename(raw)).resolve()
+            try: fp.relative_to(base.resolve())
+            except (ValueError, OSError): return self._err(403, "forbidden")
+            if not fp.is_file(): return self._err(404, "not found")
+            return self._send_file(fp)
+
+        # legacy alias
+        m = re.match(r"^/api/projects/([a-f0-9]+)/images/([^/]+)$", path)
+        if m:
+            pid, raw = m.group(1), unquote(m.group(2))
+            base = project_dirs(pid)[0]
+            fp = (base / safe_filename(raw)).resolve()
+            try: fp.relative_to(base.resolve())
+            except (ValueError, OSError): return self._err(403, "forbidden")
+            if not fp.is_file(): return self._err(404, "not found")
+            return self._send_file(fp)
+
+        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        return self._static(rel)
+
+    def do_POST(self):
+        parsed = urlparse(self.path); path = parsed.path
+
+        if path == "/api/projects":
+            return self._create_project()
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/images$", path)
+        if m: return self._upload_image(m.group(1), parsed)
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/preview$", path)
+        if m: return self._preview(m.group(1))
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/outputs$", path)
+        if m: return self._save_output(m.group(1))
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/instructir$", path)
+        if m: return self._instructir(m.group(1))
+
+        return self._err(404, "not found")
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path); path = parsed.path
+        m = re.match(r"^/api/projects/([a-f0-9]+)$", path)
+        if m:
+            pid = m.group(1)
+            with _state_lock:
+                projects = load_projects()
+                if not any(p["id"] == pid for p in projects):
+                    return self._err(404, "project not found")
+                projects = [p for p in projects if p["id"] != pid]
+                save_projects(projects)
+                proj_dir = DATA / pid
+                # Guard: must live under DATA and match the pid pattern.
+                try:
+                    resolved = proj_dir.resolve()
+                    resolved.relative_to(DATA.resolve())
+                    if resolved.name != pid:
+                        raise ValueError("unexpected path")
+                except (ValueError, OSError):
+                    return self._err(500, "refusing to remove suspicious path")
+                if resolved.is_dir():
+                    try:
+                        shutil.rmtree(resolved)
+                    except OSError as e:
+                        return self._err(500, f"remove failed: {e}")
+            return self._send_json(200, {"ok": True})
+
+        m = re.match(r"^/api/projects/([a-f0-9]+)/outputs/([^/]+)$", path)
+        if m:
+            pid, raw = m.group(1), unquote(m.group(2))
+            if not self._project_or_404(pid): return
+            base = project_dirs(pid)[1]
+            fp = (base / safe_filename(raw)).resolve()
+            try: fp.relative_to(base.resolve())
+            except (ValueError, OSError): return self._err(403, "forbidden")
+            if not fp.is_file(): return self._err(404, "not found")
+            try: fp.unlink()
+            except OSError as e: return self._err(500, f"delete failed: {e}")
+            return self._send_json(200, {"ok": True})
+        return self._err(404, "not found")
+
+    # ---------- handlers ----------
+    def _create_project(self):
+        data = self._read_json()
+        if data is None: return self._err(400, "invalid json")
+        name = (data.get("name") or "").strip()
+        desc = (data.get("description") or "").strip()
+        if not name: return self._err(400, "name is required")
+        if len(name) > 200: return self._err(400, "name too long (max 200)")
+        if len(desc) > 4000: return self._err(400, "description too long (max 4000)")
+        with _state_lock:
+            projects = load_projects()
+            p = {"id": new_id(), "name": name, "description": desc, "created_at": int(time.time())}
+            projects.append(p)
+            save_projects(projects)
+            originals, outputs = project_dirs(p["id"])
+            originals.mkdir(parents=True, exist_ok=True)
+            outputs.mkdir(parents=True, exist_ok=True)
+        return self._send_json(201, {"project": p})
+
+    def _upload_image(self, pid, parsed):
+        if not self._project_or_404(pid): return
+        qs = parse_qs(parsed.query)
+        fname = safe_filename(qs.get("name", ["upload.bin"])[0])
+        ext = os.path.splitext(fname)[1].lower()
+        if ext and ext not in UPLOAD_EXT:
+            return self._err(415, f"unsupported file type: {ext}")
+
+        length_hdr = self.headers.get("Content-Length")
+        if length_hdr is None: return self._err(411, "content-length required")
+        try: length = int(length_hdr)
+        except ValueError: return self._err(400, "invalid content-length")
+        if length <= 0: return self._err(400, "empty upload")
+
+        dest_dir = project_dirs(pid)[0]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        final = unique_path(dest_dir, fname)
+        remaining = length
+        try:
+            with final.open("wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk: break
+                    f.write(chunk); remaining -= len(chunk)
+        except OSError as e:
+            try: final.unlink(missing_ok=True)
+            except OSError: pass
+            return self._err(500, f"write failed: {e}")
+        if remaining > 0:
+            try: final.unlink(missing_ok=True)
+            except OSError: pass
+            return self._err(400, "upload truncated")
+
+        s = final.stat()
+        return self._send_json(201, {"image": {
+            "name": final.name, "size": s.st_size, "modified_at": int(s.st_mtime),
+            "editable": final.suffix.lower() in EDITABLE_EXT,
+        }})
+
+    def _preview(self, pid):
+        if not self._project_or_404(pid): return
+        data = self._read_json()
+        if data is None: return self._err(400, "invalid json")
+        source_name = data.get("source") or ""
+        source_kind = (data.get("source_kind") or "inputs").lower()
+        if source_kind not in ("inputs", "outputs"):
+            return self._err(400, f"invalid source_kind: {source_kind}")
+        source = self._resolve_source(pid, source_name, source_kind)
+        if not source: return self._err(404, "source not found")
+        if source.suffix.lower() not in EDITABLE_EXT:
+            return self._err(415, f"cannot process {source.suffix.lower()} in the editor yet")
+        ops = data.get("operations") or []
+        if not isinstance(ops, list): return self._err(400, "operations must be a list")
+        try: preview_max = int(data.get("max", 1400))
+        except (TypeError, ValueError): preview_max = 1400
+        preview_max = max(64, min(4096, preview_max))
+        try:
+            img = render_pipeline(source, ops, preview_max=preview_max)
+        except Exception as e:
+            return self._err(500, f"render failed: {e}")
+        buf = io.BytesIO()
+        # quality=95 + subsampling=0 (4:4:4) keeps colour edges crisp — matters
+        # for star fields and other high-frequency content the preview shows.
+        img.save(buf, format="JPEG", quality=95, subsampling=0, optimize=False)
+        body = buf.getvalue()
+        return self._send(200, body, "image/jpeg")
+
+    # ------------------------------------------------------------------
+    # Chat over WebSocket. Bytes flow from the tmux pane's pipe file to
+    # the client; JSON messages from the client become tmux send-keys.
+    # ------------------------------------------------------------------
+    def _handle_chat_ws(self, pid, parsed):
+        if not self._project_or_404(pid): return
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.send_error(400, "missing Sec-WebSocket-Key"); return
+        accept = _ws_accept_key(key)
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        # After handshake we own the raw socket. Prevent BaseHTTPRequestHandler
+        # from trying to keep the connection alive for another HTTP request.
+        self.close_connection = True
+
+        sock = self.connection
+        send_lock = threading.Lock()
+
+        def send_json(obj):
+            try:
+                _ws_send(sock, send_lock, WS_OP_TEXT, json.dumps(obj).encode("utf-8"))
+            except OSError:
+                raise
+
+        qs = parse_qs(parsed.query or "")
+        source = qs.get("source", [""])[0]
+        session_name = _chat_session_name(pid)
+        session = TmuxSession(session_name, cwd=str(DATA / pid))
+        pipe_path = _chat_pipe_path(pid)
+        api_base = f"http://127.0.0.1:{PORT}"
+        launch = _chat_launch_command(pid, source, api_base)
+
+        fresh = not session.exists()
+        try:
+            if fresh:
+                (DATA / pid).mkdir(parents=True, exist_ok=True)
+                session.create(launch, cols=120, rows=32)
+            session.start_pipe(str(pipe_path), truncate=True)
+        except Exception as e:
+            try: send_json({"type": "error", "message": f"tmux: {e}"})
+            except OSError: pass
+            return
+
+        try:
+            send_json({"type": "hello", "session": session_name, "fresh": fresh})
+            if not fresh:
+                snap = session.snapshot_visible()
+                if snap:
+                    send_json({"type": "data", "b64": base64.b64encode(snap).decode("ascii")})
+        except OSError:
+            return
+
+        stop_flag = threading.Event()
+
+        def pump():
+            try:
+                fh = open(pipe_path, "rb")
+            except OSError:
+                return
+            try:
+                while not stop_flag.is_set():
+                    chunk = fh.read(65536)
+                    if chunk:
+                        try:
+                            send_json({"type": "data", "b64": base64.b64encode(chunk).decode("ascii")})
+                        except OSError:
+                            return
+                    else:
+                        time.sleep(0.05)
+            finally:
+                try: fh.close()
+                except OSError: pass
+
+        pump_thread = threading.Thread(target=pump, name=f"chat-pump-{pid}", daemon=True)
+        pump_thread.start()
+
+        try:
+            while True:
+                msg = _ws_recv_message(sock)
+                if msg is None: break
+                opcode, data = msg
+                if opcode == WS_OP_CLOSE:
+                    try: _ws_send(sock, send_lock, WS_OP_CLOSE, b"")
+                    except OSError: pass
+                    break
+                if opcode == WS_OP_PING:
+                    try: _ws_send(sock, send_lock, WS_OP_PONG, data)
+                    except OSError: break
+                    continue
+                if opcode not in (WS_OP_TEXT, WS_OP_BIN):
+                    continue
+                try:
+                    obj = json.loads(data.decode("utf-8", "replace"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                t = obj.get("type")
+                if t == "input":
+                    session.send_text(obj.get("data") or "")
+                elif t == "key":
+                    session.send_key(str(obj.get("key") or ""))
+                elif t == "resize":
+                    try:
+                        cols = int(obj.get("cols", 120)); rows = int(obj.get("rows", 32))
+                    except (TypeError, ValueError):
+                        continue
+                    if 20 <= cols <= 500 and 5 <= rows <= 200:
+                        session.resize(cols, rows)
+                elif t == "restart":
+                    session.kill()
+                    try:
+                        session.create(launch, cols=120, rows=32)
+                        session.start_pipe(str(pipe_path))
+                        session.send_key("C-l")
+                    except Exception as e:
+                        try: send_json({"type": "error", "message": f"restart failed: {e}"})
+                        except OSError: break
+                elif t == "clear":
+                    session.send_key("C-l")
+                elif t == "ping":
+                    try: send_json({"type": "pong", "t": time.time()})
+                    except OSError: break
+        except OSError:
+            pass
+        finally:
+            stop_flag.set()
+
+    def _save_output(self, pid):
+        if not self._project_or_404(pid): return
+        data = self._read_json()
+        if data is None: return self._err(400, "invalid json")
+        source_kind = (data.get("source_kind") or "inputs").lower()
+        if source_kind not in ("inputs", "outputs"):
+            return self._err(400, f"invalid source_kind: {source_kind}")
+        source = self._resolve_source(pid, data.get("source") or "", source_kind)
+        if not source: return self._err(404, "source not found")
+        if source.suffix.lower() not in EDITABLE_EXT:
+            return self._err(415, f"cannot process {source.suffix.lower()} in the editor yet")
+        ops = data.get("operations") or []
+        if not isinstance(ops, list): return self._err(400, "operations must be a list")
+        fmt_key = (data.get("format") or "jpg").lower()
+        if fmt_key not in SAVE_FORMATS: return self._err(400, f"unsupported format: {fmt_key}")
+        pil_format, default_ext = SAVE_FORMATS[fmt_key]
+
+        raw_name = (data.get("output_name") or "").strip()
+        if not raw_name:
+            raw_name = source.stem + "-processed"
+        base_name = safe_filename(raw_name)
+        if not base_name.lower().endswith(default_ext):
+            base_name = os.path.splitext(base_name)[0] + default_ext
+
+        outputs_dir = project_dirs(pid)[1]
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        final = unique_path(outputs_dir, base_name)
+
+        try:
+            img = render_pipeline(source, ops, preview_max=None)
+        except Exception as e:
+            return self._err(500, f"render failed: {e}")
+        save_kwargs = {}
+        if pil_format == "JPEG":
+            save_kwargs.update(
+                quality=int(_clamp(data.get("quality", 95), 40, 100)),
+                subsampling=0,
+                optimize=True,
+            )
+        try:
+            img.save(final, format=pil_format, **save_kwargs)
+        except Exception as e:
+            try: final.unlink(missing_ok=True)
+            except OSError: pass
+            return self._err(500, f"save failed: {e}")
+
+        s = final.stat()
+        return self._send_json(201, {"output": {
+            "name": final.name, "size": s.st_size, "modified_at": int(s.st_mtime),
+            "editable": False,
+        }})
+
+    def _instructir(self, pid):
+        if not self._project_or_404(pid): return
+        data = self._read_json()
+        if data is None: return self._err(400, "invalid json")
+        kind = (data.get("source_kind") or "inputs").lower()
+        if kind not in ("inputs", "outputs"):
+            return self._err(400, f"invalid source_kind: {kind}")
+        src = self._resolve_source(pid, data.get("source") or "", kind)
+        if not src: return self._err(404, "source not found")
+        if src.suffix.lower() not in EDITABLE_EXT:
+            return self._err(415, f"cannot process {src.suffix.lower()} yet")
+        instruction = (data.get("instruction") or "").strip()
+        if not instruction: return self._err(400, "instruction required")
+        mode = (data.get("mode") or "preview").lower()
+        if mode not in ("preview", "save"):
+            return self._err(400, "mode must be 'preview' or 'save'")
+
+        try:
+            import instructir_runtime  # local module, lazy import
+        except Exception as e:
+            return self._err(500, f"instructir runtime unavailable: {e}")
+
+        try:
+            with Image.open(src) as raw:
+                img_in = raw.convert("RGB")
+            out_img = instructir_runtime.run(img_in, instruction)
+        except Exception as e:
+            return self._err(500, f"instructir failed: {e}")
+
+        if mode == "preview":
+            buf = io.BytesIO()
+            out_img.save(buf, format="JPEG", quality=95, subsampling=0, optimize=False)
+            return self._send(200, buf.getvalue(), "image/jpeg")
+
+        stem = os.path.splitext(src.name)[0]
+        raw_name = (data.get("output_name") or f"{stem}-instructir").strip()
+        base_name = safe_filename(raw_name)
+        base_ext = os.path.splitext(base_name)[1].lower()
+        if base_ext not in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+            base_name = base_name + ".png"
+        outputs_dir = project_dirs(pid)[1]
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        final = unique_path(outputs_dir, base_name)
+        ext = os.path.splitext(final.name)[1].lower()
+        pil_format = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
+                      ".tif": "TIFF", ".tiff": "TIFF"}.get(ext, "PNG")
+        save_kwargs = {}
+        if pil_format == "JPEG":
+            save_kwargs = {"quality": 95, "subsampling": 0, "optimize": True}
+        try:
+            out_img.save(final, format=pil_format, **save_kwargs)
+        except Exception as e:
+            try: final.unlink(missing_ok=True)
+            except OSError: pass
+            return self._err(500, f"save failed: {e}")
+        s = final.stat()
+        return self._send_json(201, {"output": {
+            "name": final.name, "size": s.st_size, "modified_at": int(s.st_mtime),
+            "editable": final.suffix.lower() in EDITABLE_EXT,
+        }})
+
+
+# ---------------------------------------------------------------------------
+# tmux session helper (chat with the `claude` CLI, pane bytes → WebSocket)
+# ---------------------------------------------------------------------------
+
+TMUX_BIN = "tmux"
+
+
+def _run_cmd(*args, timeout=15):
+    return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+
+
+class TmuxSession:
+    """Minimal wrapper around a named detached tmux session."""
+
+    def __init__(self, name: str, cwd: str | None = None):
+        self.name = name
+        self.cwd = cwd
+
+    def exists(self) -> bool:
+        return _run_cmd(TMUX_BIN, "has-session", "-t", self.name).returncode == 0
+
+    def create(self, command: str | None, cols: int = 120, rows: int = 32,
+               env: dict | None = None) -> None:
+        if self.exists(): return
+        args = [TMUX_BIN, "new-session", "-d", "-s", self.name,
+                "-x", str(cols), "-y", str(rows)]
+        if self.cwd: args += ["-c", self.cwd]
+        if env:
+            for k, v in env.items():
+                args += ["-e", f"{k}={v}"]
+        if command: args += [command]
+        r = _run_cmd(*args)
+        if r.returncode != 0:
+            raise RuntimeError(f"tmux new-session failed: {r.stderr.strip()}")
+
+    def resize(self, cols: int, rows: int) -> None:
+        _run_cmd(TMUX_BIN, "resize-window", "-t", self.name,
+                 "-x", str(cols), "-y", str(rows))
+
+    def send_text(self, text: str) -> None:
+        if not text: return
+        data = text.encode("utf-8")
+        # send-keys -H writes hex pairs literally — safe for any byte incl. ';'.
+        CHUNK = 512
+        for i in range(0, len(data), CHUNK):
+            chunk = data[i:i + CHUNK]
+            hex_args = [f"{b:02x}" for b in chunk]
+            _run_cmd(TMUX_BIN, "send-keys", "-t", self.name, "-H", *hex_args)
+
+    def send_key(self, key: str) -> None:
+        _run_cmd(TMUX_BIN, "send-keys", "-t", self.name, key)
+
+    def snapshot_visible(self) -> bytes:
+        r = _run_cmd(TMUX_BIN, "capture-pane", "-t", self.name, "-p", "-e", "-J")
+        if r.returncode != 0: return b""
+        text = r.stdout.replace("\n", "\r\n")
+        return text.encode("utf-8", "replace") + b"\x1b[0m"
+
+    def start_pipe(self, dest_path: str, truncate: bool = True) -> None:
+        _run_cmd(TMUX_BIN, "pipe-pane", "-t", self.name)
+        if truncate or not Path(dest_path).exists():
+            Path(dest_path).write_bytes(b"")
+        _run_cmd(TMUX_BIN, "pipe-pane", "-t", self.name,
+                 f"cat >> {shlex.quote(dest_path)}")
+
+    def kill(self) -> None:
+        _run_cmd(TMUX_BIN, "pipe-pane", "-t", self.name)
+        _run_cmd(TMUX_BIN, "kill-session", "-t", self.name)
+
+
+def _chat_session_name(pid: str) -> str:
+    return f"astrophoto_chat_{pid}"
+
+
+def _chat_pipe_path(pid: str) -> Path:
+    return DATA / pid / ".chat.pipe"
+
+
+def _chat_launch_command(pid: str, source: str, api_base: str) -> str:
+    launcher = ROOT / "bin" / "astrophoto-chat-claude"
+    parts = [
+        f"ASTROPHOTO_PID={shlex.quote(pid)}",
+        f"ASTROPHOTO_SOURCE={shlex.quote(source or '')}",
+        f"ASTROPHOTO_API={shlex.quote(api_base)}",
+        shlex.quote(str(launcher)),
+    ]
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket (RFC 6455) — inline in http.server, no extra deps.
+# ---------------------------------------------------------------------------
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_OP_CONT = 0x0
+WS_OP_TEXT = 0x1
+WS_OP_BIN  = 0x2
+WS_OP_CLOSE = 0x8
+WS_OP_PING = 0x9
+WS_OP_PONG = 0xA
+
+
+def _ws_accept_key(client_key: str) -> str:
+    return base64.b64encode(hashlib.sha1((client_key + WS_MAGIC).encode()).digest()).decode()
+
+
+def _ws_send(sock, lock: threading.Lock, opcode: int, payload: bytes) -> None:
+    header = bytearray([0x80 | (opcode & 0x0f)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n <= 0xFFFF:
+        header.append(126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(127)
+        header += struct.pack(">Q", n)
+    with lock:
+        sock.sendall(bytes(header))
+        if payload:
+            sock.sendall(payload)
+
+
+def _ws_recv_exact(sock, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk: return None
+        buf += chunk
+    return bytes(buf)
+
+
+def _ws_recv_message(sock) -> tuple[int, bytes] | None:
+    """Read one full message, handling fragmentation. Returns (first_opcode, payload) or None on close."""
+    payload = bytearray()
+    first_opcode = None
+    while True:
+        header = _ws_recv_exact(sock, 2)
+        if header is None: return None
+        b1, b2 = header[0], header[1]
+        fin = bool(b1 & 0x80)
+        opcode = b1 & 0x0f
+        masked = bool(b2 & 0x80)
+        plen = b2 & 0x7f
+        if plen == 126:
+            ext = _ws_recv_exact(sock, 2)
+            if ext is None: return None
+            plen = struct.unpack(">H", ext)[0]
+        elif plen == 127:
+            ext = _ws_recv_exact(sock, 8)
+            if ext is None: return None
+            plen = struct.unpack(">Q", ext)[0]
+        mask = _ws_recv_exact(sock, 4) if masked else None
+        data = _ws_recv_exact(sock, plen) if plen else b""
+        if plen and data is None: return None
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        # Control frames arrive whole, never fragmented.
+        if opcode >= 0x8:
+            return (opcode, data or b"")
+        if first_opcode is None:
+            first_opcode = opcode
+        payload += data or b""
+        if fin:
+            return (first_opcode or WS_OP_TEXT, bytes(payload))
+
+
+class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main() -> int:
+    if not WWW.is_dir():
+        print(f"error: {WWW} does not exist", file=sys.stderr); return 1
+    DATA.mkdir(parents=True, exist_ok=True)
+    with ThreadedServer((HOST, PORT), Handler) as httpd:
+        print(f"astrophoto serving http://{HOST}:{PORT}  (www={WWW}, data={DATA})")
+        try: httpd.serve_forever()
+        except KeyboardInterrupt: print("\nshutting down")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+data/
+__pycache__/
+*.pyc
+.venv/
+
+# Third-party downloads — pulled at setup time, not committed to keep the repo small.
+models/instructir/
+models/instructir_src/

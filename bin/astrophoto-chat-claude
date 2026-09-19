@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Launcher for the chat-side `claude` CLI on behalf of the astrophoto editor.
+#
+#   cwd:            data/$ASTROPHOTO_PID/    (set by the server)
+#   Write/Edit:     disabled at the harness layer
+#   Persona:        chat_prompt.md, with env vars substituted
+#
+# The persona teaches Claude to use the astrophoto HTTP API for every image
+# change, so nothing writes to originals/ directly.
+set -euo pipefail
+
+: "${ASTROPHOTO_PID:?ASTROPHOTO_PID env var is required}"
+: "${ASTROPHOTO_API:=http://127.0.0.1:6991}"
+: "${ASTROPHOTO_SOURCE:=}"
+
+HERE="$(dirname "$(readlink -f "$0")")"
+ROOT="$(dirname "$HERE")"
+PROMPT_FILE="$ROOT/chat_prompt.md"
+
+# envsubst is used to interpolate the three env vars into the persona; if it
+# isn't available we fall back to the untemplated file (Claude still sees the
+# env vars in its own environment).
+if command -v envsubst >/dev/null 2>&1; then
+    PERSONA="$(ASTROPHOTO_PID="$ASTROPHOTO_PID" \
+               ASTROPHOTO_API="$ASTROPHOTO_API" \
+               ASTROPHOTO_SOURCE="$ASTROPHOTO_SOURCE" \
+               envsubst '$ASTROPHOTO_PID $ASTROPHOTO_API $ASTROPHOTO_SOURCE' \
+               < "$PROMPT_FILE")"
+else
+    PERSONA="$(cat "$PROMPT_FILE")"
+fi
+
+exec claude \
+    --model claude-opus-4-7 \
+    --dangerously-skip-permissions \
+    --disallowedTools "Write Edit MultiEdit NotebookEdit" \
+    --append-system-prompt "$PERSONA"

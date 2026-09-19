@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Astrophoto</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="vendor/xterm/xterm.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>Astrophoto</span>
+    </div>
+    <div class="topbar-right" id="topbar-right"></div>
+  </header>
+
+  <main class="shell">
+    <aside class="sidebar" aria-label="Projects">
+      <div class="sidebar-head">
+        <h2>Projects</h2>
+        <button class="btn btn-primary btn-sm" id="new-project-btn" type="button">
+          <span class="plus" aria-hidden="true">+</span> New
+        </button>
+      </div>
+      <ul class="project-list" id="project-list" role="list">
+        <li class="project-list-empty" id="project-list-empty">No projects yet.</li>
+      </ul>
+    </aside>
+
+    <section class="content" id="content" aria-live="polite"></section>
+  </main>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <!-- ============ Templates ============ -->
+
+  <template id="tpl-empty-state">
+    <div class="empty-state">
+      <h1>Welcome</h1>
+      <p class="muted">Start a project to begin uploading and processing images.</p>
+      <button class="btn btn-primary" data-action="new-project" type="button">
+        <span class="plus" aria-hidden="true">+</span> New project
+      </button>
+    </div>
+  </template>
+
+  <template id="tpl-new-project">
+    <form class="panel new-project-form" data-form="new-project" novalidate>
+      <header class="panel-head">
+        <h1>New project</h1>
+        <p class="muted">Name it and give it a short description. You can upload images once it's created.</p>
+      </header>
+      <label class="field">
+        <span class="field-label">Name</span>
+        <input class="input" name="name" type="text" required maxlength="200" autocomplete="off" placeholder="e.g. M31 – Andromeda, Oct 2026" />
+        <span class="field-error" data-error-for="name"></span>
+      </label>
+      <label class="field">
+        <span class="field-label">Description <span class="muted">(optional)</span></span>
+        <textarea class="input" name="description" rows="4" maxlength="4000" placeholder="Target, session notes, gear…"></textarea>
+        <span class="field-error" data-error-for="description"></span>
+      </label>
+      <div class="panel-actions">
+        <button class="btn" type="button" data-action="cancel-new-project">Cancel</button>
+        <button class="btn btn-primary" type="submit">Create project</button>
+      </div>
+    </form>
+  </template>
+
+  <template id="tpl-project-detail">
+    <div class="project-detail">
+      <header class="panel-head">
+        <div class="project-title">
+          <h1 data-field="name"></h1>
+          <p class="muted" data-field="meta"></p>
+        </div>
+      </header>
+
+      <p class="project-description muted" data-field="description"></p>
+
+      <section class="upload-zone" data-dropzone tabindex="0" aria-label="Upload images">
+        <div class="upload-zone-inner">
+          <div class="upload-icon" aria-hidden="true"></div>
+          <p><strong>Drop images here</strong> or <button class="btn-link" type="button" data-action="pick-files">browse</button></p>
+          <p class="muted small">JPG, PNG, TIFF, WebP, FITS, or common RAW formats.</p>
+        </div>
+        <input type="file" multiple hidden data-file-input
+               accept=".jpg,.jpeg,.png,.tif,.tiff,.webp,.bmp,.fits,.fit,.fts,.cr2,.cr3,.nef,.arw,.raf,.dng,.orf,.rw2" />
+      </section>
+
+      <section class="uploads" data-uploads hidden>
+        <div class="section-head"><h2>Uploading</h2></div>
+        <ul class="upload-list" data-upload-list></ul>
+      </section>
+
+      <section class="assets">
+        <div class="section-head">
+          <h2>Inputs <span class="badge" data-input-count>0</span></h2>
+          <span class="muted small">Uploaded originals — never modified.</span>
+        </div>
+        <div class="image-grid" data-input-grid></div>
+        <p class="muted empty-line" data-empty-inputs hidden>No inputs yet — drop some images above.</p>
+      </section>
+
+      <section class="assets">
+        <div class="section-head">
+          <h2>Outputs <span class="badge" data-output-count>0</span></h2>
+          <span class="muted small">Processed images saved from the editor.</span>
+        </div>
+        <div class="image-grid" data-output-grid></div>
+        <p class="muted empty-line" data-empty-outputs hidden>No outputs yet — open an input to edit it.</p>
+      </section>
+    </div>
+  </template>
+
+  <template id="tpl-image-tile">
+    <div class="image-tile">
+      <div class="thumb"></div>
+      <div class="meta">
+        <span class="name"></span>
+        <span class="sub"></span>
+      </div>
+      <div class="tile-actions">
+        <button class="btn btn-sm" type="button" data-action="tile-primary"></button>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-editor">
+    <div class="editor">
+      <header class="editor-head">
+        <div class="editor-head-left">
+          <button class="btn" type="button" data-action="editor-back">← Back</button>
+          <div>
+            <h1 data-field="name"></h1>
+            <p class="muted small" data-field="sub"></p>
+          </div>
+        </div>
+        <div class="editor-head-right">
+          <button class="btn" type="button" data-action="editor-compare" data-toggle="off" title="Show original vs edited">Compare</button>
+          <button class="btn" type="button" data-action="editor-chat" data-toggle="off" title="Chat with an AI assistant">Chat</button>
+          <span class="head-sep" aria-hidden="true"></span>
+          <button class="btn" type="button" data-action="editor-reset">Reset</button>
+          <button class="btn" type="button" data-action="editor-undo">Undo</button>
+          <button class="btn" type="button" data-action="editor-redo">Redo</button>
+          <button class="btn btn-primary" type="button" data-action="editor-save">Save to outputs…</button>
+        </div>
+      </header>
+
+      <div class="editor-body" data-editor-body>
+        <div class="editor-canvas" data-canvas>
+          <div class="editor-preview-wrap" data-preview-wrap>
+            <!-- single-view -->
+            <img class="editor-preview" alt="preview" data-preview />
+            <!-- side-by-side compare (hidden until Compare is toggled on) -->
+            <div class="editor-compare" data-compare hidden>
+              <div class="compare-half">
+                <div class="compare-label">Original</div>
+                <img alt="original" data-compare-orig />
+              </div>
+              <div class="compare-half">
+                <div class="compare-label">Edited</div>
+                <img alt="edited" data-compare-edit />
+              </div>
+            </div>
+            <div class="editor-preview-spinner" data-spinner hidden></div>
+          </div>
+        </div>
+
+        <aside class="editor-panel">
+          <div class="panel-scroll">
+
+            <div class="op-group op-group-hero">
+              <button class="btn btn-hero" type="button" data-op="auto_enhance">
+                <span class="sparkle" aria-hidden="true"></span>
+                Auto enhance
+              </button>
+              <div class="op-hint muted small">
+                One click: percentile stretch, midtone lift, contrast + saturation, subtle sharpen.
+              </div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Enhance</div>
+              <button class="btn btn-op" type="button" data-op="auto_stretch">Auto stretch</button>
+              <div class="op-hint muted small">Percentile histogram stretch (0.5% / 99.5%).</div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Adjust</div>
+              <div class="slider-row">
+                <label>Brightness <span class="slider-val" data-val="brightness">1.00</span></label>
+                <input type="range" min="0.2" max="2.5" step="0.01" value="1" data-slider="brightness" data-default="1" />
+              </div>
+              <div class="slider-row">
+                <label>Contrast <span class="slider-val" data-val="contrast">1.00</span></label>
+                <input type="range" min="0.2" max="2.5" step="0.01" value="1" data-slider="contrast" data-default="1" />
+              </div>
+              <div class="slider-row">
+                <label>Gamma <span class="slider-val" data-val="gamma">1.00</span></label>
+                <input type="range" min="0.3" max="3.0" step="0.01" value="1" data-slider="gamma" data-default="1" />
+              </div>
+              <div class="slider-row">
+                <label>Saturation <span class="slider-val" data-val="saturation">1.00</span></label>
+                <input type="range" min="0" max="2.5" step="0.01" value="1" data-slider="saturation" data-default="1" />
+              </div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Levels</div>
+              <div class="slider-row">
+                <label>Black <span class="slider-val" data-val="lv-black">0</span></label>
+                <input type="range" min="0" max="254" step="1" value="0" data-levels="black" />
+              </div>
+              <div class="slider-row">
+                <label>White <span class="slider-val" data-val="lv-white">255</span></label>
+                <input type="range" min="1" max="255" step="1" value="255" data-levels="white" />
+              </div>
+              <div class="slider-row">
+                <label>Midtone γ <span class="slider-val" data-val="lv-gamma">1.00</span></label>
+                <input type="range" min="0.3" max="3.0" step="0.01" value="1" data-levels="gamma" />
+              </div>
+              <button class="btn btn-sm btn-op" type="button" data-action="commit-levels">Apply levels</button>
+              <div class="op-hint muted small">Levels are staged; press Apply to add them to the pipeline.</div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Sharpen</div>
+              <div class="slider-row">
+                <label>Radius <span class="slider-val" data-val="sh-radius">2.0</span></label>
+                <input type="range" min="0.3" max="6" step="0.1" value="2" data-sharpen="radius" />
+              </div>
+              <div class="slider-row">
+                <label>Amount <span class="slider-val" data-val="sh-amount">150</span></label>
+                <input type="range" min="0" max="400" step="5" value="150" data-sharpen="amount" />
+              </div>
+              <div class="slider-row">
+                <label>Threshold <span class="slider-val" data-val="sh-threshold">3</span></label>
+                <input type="range" min="0" max="20" step="1" value="3" data-sharpen="threshold" />
+              </div>
+              <button class="btn btn-sm btn-op" type="button" data-action="commit-sharpen">Apply sharpen</button>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Reduce noise</div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-op="denoise" data-args='{"size":3}'>Median 3</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="denoise" data-args='{"size":5}'>Median 5</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="denoise" data-args='{"size":7}'>Median 7</button>
+              </div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-op="blur" data-args='{"radius":0.8}'>Soften ▹</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="blur" data-args='{"radius":2}'>Soften ▹▹</button>
+              </div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Transform</div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-op="rotate" data-args='{"degrees":-90}'>Rotate 90° CCW</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="rotate" data-args='{"degrees":90}'>Rotate 90° CW</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="rotate" data-args='{"degrees":180}'>180°</button>
+              </div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-op="flip_h">Flip H</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="flip_v">Flip V</button>
+              </div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Style</div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-op="grayscale">Grayscale</button>
+                <button class="btn btn-sm btn-op" type="button" data-op="invert">Invert</button>
+              </div>
+            </div>
+
+            <div class="op-group">
+              <div class="op-group-head">Remove streak / trail</div>
+              <div class="slider-row">
+                <label>Angle <span class="slider-val" data-val="rs-angle">0°</span></label>
+                <input type="range" min="-90" max="90" step="1" value="0" data-streak="angle" />
+              </div>
+              <div class="slider-row">
+                <label>Streak width (± px) <span class="slider-val" data-val="rs-vr">3</span></label>
+                <input type="range" min="1" max="10" step="1" value="3" data-streak="vertical_radius" />
+              </div>
+              <div class="slider-row">
+                <label>Streak length (± px) <span class="slider-val" data-val="rs-hr">15</span></label>
+                <input type="range" min="6" max="40" step="1" value="15" data-streak="horizontal_radius" />
+              </div>
+              <div class="slider-row">
+                <label>Sensitivity <span class="slider-val" data-val="rs-thr">10</span></label>
+                <input type="range" min="2" max="60" step="1" value="10" data-streak="threshold" />
+              </div>
+              <div class="op-buttons">
+                <button class="btn btn-sm btn-op" type="button" data-action="commit-streak">Apply removal</button>
+                <button class="btn btn-sm btn-op" type="button" data-action="autofind-streak" title="Try 0°, 45°, 90°, 135° — sets the angle that suppresses the most bright linear artefact">Auto‑find angle</button>
+              </div>
+              <div class="op-hint muted small">Preview updates live. Increase sensitivity if the trail is faint; decrease it if stars are being clipped.</div>
+            </div>
+
+            <div class="op-group history-group">
+              <div class="op-group-head">History <span class="badge" data-history-count>0</span></div>
+              <ol class="history-list" data-history></ol>
+              <p class="muted small empty-line" data-history-empty>No operations yet.</p>
+            </div>
+
+          </div>
+        </aside>
+      </div>
+
+      <!-- Chat drawer (Claude terminal + InstructIR form) — hidden until Chat is toggled -->
+      <aside class="chat-drawer" data-chat-drawer hidden>
+        <header class="chat-drawer-head">
+          <div class="chat-mode" role="tablist" aria-label="Assistant">
+            <button class="chat-mode-btn is-active" type="button" role="tab" data-chat-mode="claude">Claude</button>
+            <button class="chat-mode-btn" type="button" role="tab" data-chat-mode="instructir">InstructIR</button>
+          </div>
+          <div class="chat-actions">
+            <button class="btn btn-sm" type="button" data-action="chat-restart" title="Restart the Claude session">Restart</button>
+            <button class="btn btn-sm" type="button" data-action="chat-clear" title="Clear screen (C-l)">Clear</button>
+            <button class="btn btn-sm" type="button" data-action="chat-close" aria-label="Close chat">×</button>
+          </div>
+        </header>
+        <div class="chat-drawer-body" data-chat-body>
+          <div class="chat-pane" data-chat-pane="claude">
+            <div class="chat-status" data-chat-status>connecting…</div>
+            <div class="xterm-host" data-chat-term></div>
+          </div>
+          <div class="chat-pane" data-chat-pane="instructir" hidden>
+            <p class="muted small">
+              Ask InstructIR (a specialised image-restoration model) to clean up
+              or enhance the current image in one shot. It's trained on denoising,
+              deraining, deblurring, dehazing, and low-light enhancement.
+            </p>
+            <label class="field">
+              <span class="field-label">Instruction</span>
+              <textarea class="input" data-instructir-prompt rows="3" placeholder="e.g. remove noise and enhance the low-light details"></textarea>
+            </label>
+            <div class="panel-actions">
+              <button class="btn" type="button" data-action="instructir-preview">Preview</button>
+              <button class="btn btn-primary" type="button" data-action="instructir-save">Apply &amp; save</button>
+            </div>
+            <div class="instructir-status muted small" data-instructir-status></div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Save-as inline panel (hidden until Save is pressed) -->
+      <div class="save-panel" data-save-panel hidden>
+        <div class="save-panel-inner">
+          <h2>Save to outputs</h2>
+          <label class="field">
+            <span class="field-label">Filename</span>
+            <input class="input" type="text" data-save-name maxlength="200" />
+          </label>
+          <label class="field">
+            <span class="field-label">Format</span>
+            <select class="input" data-save-format>
+              <option value="jpg">JPEG (small, lossy)</option>
+              <option value="png">PNG (lossless)</option>
+              <option value="tiff">TIFF (16-bit-capable, lossless)</option>
+            </select>
+          </label>
+          <label class="field" data-jpg-quality>
+            <span class="field-label">JPEG quality <span class="slider-val" data-save-quality-val>92</span></span>
+            <input type="range" min="60" max="100" step="1" value="92" data-save-quality />
+          </label>
+          <div class="panel-actions">
+            <button class="btn" type="button" data-action="cancel-save">Cancel</button>
+            <button class="btn btn-primary" type="button" data-action="confirm-save">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="vendor/xterm/xterm.js"></script>
+  <script src="vendor/xterm/xterm-addon-fit.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
