@@ -458,7 +458,7 @@
       saveOpen: false,
       saving: false,
       // chat drawer
-      chat: existingChat || { open: false, mode: "claude", ws: null, term: null, fit: null, status: "idle" },
+      chat: existingChat || { open: true, mode: "claude", ws: null, term: null, fit: null, status: "idle" },
     };
     renderView();
     requestPreview();

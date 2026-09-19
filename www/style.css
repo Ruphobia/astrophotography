@@ -528,6 +528,20 @@ input[type="range"]::-moz-range-thumb {
   border-color: var(--accent);
   color: #eaf0ff;
 }
+/* Always-loud AI chat button */
+.btn-chat {
+  background: linear-gradient(135deg, #4d64a8 0%, #6b53a5 100%);
+  border-color: var(--accent);
+  color: #f2f6ff;
+  font-weight: 600;
+}
+.btn-chat:hover {
+  background: linear-gradient(135deg, #5b73bd 0%, #7d63bb 100%);
+  border-color: var(--accent-strong);
+}
+.btn-chat[data-toggle="on"] {
+  box-shadow: 0 0 0 2px rgba(122,162,255,0.35);
+}
 .head-sep {
   width: 1px; height: 22px; background: var(--border-strong);
   margin: 0 4px;
