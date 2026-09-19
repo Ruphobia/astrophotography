@@ -972,8 +972,15 @@
     });
     if (mode === "claude") {
       connectChatWebSocket();
-      // Give the terminal a moment to relayout after unhiding.
-      setTimeout(() => { if (ed.chat.fit) try { ed.chat.fit.fit(); } catch {} }, 30);
+      // Give the terminal a moment to relayout after unhiding, and focus the input.
+      setTimeout(() => {
+        if (ed.chat.fit) try { ed.chat.fit.fit(); } catch {}
+        const input = $("[data-chat-input]"); if (input) try { input.focus(); } catch {}
+      }, 30);
+    } else if (mode === "instructir") {
+      setTimeout(() => {
+        const t = $("[data-instructir-prompt]"); if (t) try { t.focus(); } catch {}
+      }, 30);
     }
   }
 
@@ -994,7 +1001,31 @@
     });
     $$(".chat-pane", drawer).forEach((p) => p.hidden = p.dataset.chatPane !== ed.chat.mode);
 
-    if (ed.chat.mode === "claude") connectChatWebSocket();
+    // Wire the "Ask Claude" input bar to send whole prompts to the terminal.
+    const form = drawer.querySelector("[data-chat-input-form]");
+    const input = drawer.querySelector("[data-chat-input]");
+    if (form && input && !form.dataset.wired) {
+      form.dataset.wired = "1";
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const text = input.value;
+        if (!text) return;
+        const ws = ed.chat.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          toast("Chat is not connected yet — give Claude a couple of seconds to boot.", "warn");
+          return;
+        }
+        // Send the text plus a carriage return to submit it inside the CLI TUI.
+        ws.send(JSON.stringify({ type: "input", data: text + "\r" }));
+        input.value = "";
+      });
+    }
+
+    if (ed.chat.mode === "claude") {
+      connectChatWebSocket();
+      // Focus the friendly input bar so the user sees a cursor right away.
+      setTimeout(() => { if (input) try { input.focus(); } catch {} }, 40);
+    }
     wireInstructIrPanel(drawer.querySelector('[data-chat-pane="instructir"]'));
   }
 

@@ -618,6 +618,15 @@ input[type="range"]::-moz-range-thumb {
 .xterm-host .xterm-viewport {
   background: transparent !important;
 }
+.chat-input-bar {
+  display: flex; gap: 6px;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+.chat-input-bar .input { padding: 8px 10px; }
+.chat-input-bar .btn { flex-shrink: 0; }
 .instructir-status {
   margin-top: 8px;
   min-height: 1em;

@@ -327,8 +327,14 @@
         </header>
         <div class="chat-drawer-body" data-chat-body>
           <div class="chat-pane" data-chat-pane="claude">
-            <div class="chat-status" data-chat-status>connecting…</div>
+            <div class="chat-status" data-chat-status>connecting to Claude — this can take a few seconds…</div>
             <div class="xterm-host" data-chat-term></div>
+            <form class="chat-input-bar" data-chat-input-form>
+              <input class="input" type="text" data-chat-input
+                     placeholder="Ask Claude anything about this image…"
+                     autocomplete="off" />
+              <button class="btn btn-primary btn-sm" type="submit">Send</button>
+            </form>
           </div>
           <div class="chat-pane" data-chat-pane="instructir" hidden>
             <p class="muted small">
