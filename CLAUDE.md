@@ -95,7 +95,12 @@ Editor page has a **Chat** toggle. The drawer runs in two modes:
   `models/instructir_src/`. Endpoint: `POST /api/projects/<pid>/instructir`
   with `{source, source_kind, instruction, mode: "preview"|"save"}` — preview
   returns JPEG bytes, save writes into `outputs/` and returns JSON.
-  Wrapper: `instructir_runtime.py`.
+  Wrapper: `instructir_runtime.py`. Deps beyond torch+transformers:
+  `imageio`, `opencv-python`, `tokenizers>=0.20,<0.21`, `astropy`. On
+  Ubuntu 24 / Python 3.12 install with `pip install --user
+  --break-system-packages …`. The system Python's
+  `/usr/local/lib/python3.12/dist-packages/tokenizers-0.21.0` metadata is
+  broken; installing to `--user` shadows it and is the recommended fix.
 
 ## Compare (side-by-side)
 

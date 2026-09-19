@@ -63,7 +63,7 @@ def load_model():
             txtdim=cfg.model.textdim,
         )
         model.load_state_dict(
-            torch.load(str(MODEL_DIR / "im_instructir-7d.pt"), map_location=device),
+            torch.load(str(MODEL_DIR / "im_instructir-7d.pt"), map_location=device, weights_only=False),
             strict=True,
         )
         model.to(device).eval()
@@ -75,7 +75,7 @@ def load_model():
             num_classes=cfg.llm.nclasses,
         )
         lm_head.load_state_dict(
-            torch.load(str(MODEL_DIR / "lm_instructir-7d.pt"), map_location=device),
+            torch.load(str(MODEL_DIR / "lm_instructir-7d.pt"), map_location=device, weights_only=False),
             strict=True,
         )
         lm_head.to(device).eval()
